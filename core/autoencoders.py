@@ -161,10 +161,10 @@ def train_ae(model, train_loader, val_loader, device, epochs, lr, loss_norm_flag
             fig.savefig(os.path.join(result_dir, 'plot_reconstruction_progress_'+str(epoch)+'.png'))       
             torch.save(model, os.path.join(result_dir, 'ae_model_ep'+str(epoch)+'.pt'))
 
-        # Save best model
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            torch.save(model, os.path.join(result_dir, 'ae_model_at_min_val_loss.pt'))
+        # # Save best model
+        # if val_loss < best_val_loss:
+        #     best_val_loss = val_loss
+        #     torch.save(model, os.path.join(result_dir, 'ae_model_at_min_val_loss.pt'))
 
     joblib.dump(train_losses, os.path.join(result_dir, 'train_losses_ep'+ str(epoch)+'.pkl'))
     joblib.dump(val_losses, os.path.join(result_dir, 'val_losses_ep'+ str(epoch)+'.pkl'))
