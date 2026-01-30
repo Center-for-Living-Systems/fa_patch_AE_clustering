@@ -14,7 +14,7 @@ import os
 import joblib
 
 class AE(torch.nn.Module):
-    def __init__(self, latent_dim=8, input_ps=32, BN_flag=False, dropout_flag=False):
+    def __init__(self, latent_dim=8, input_ps=32, no_ch = 1,BN_flag=False, dropout_flag=False):
         super(AE, self).__init__()
 
         # Compute the spatial size after 3 conv layers
@@ -24,7 +24,7 @@ class AE(torch.nn.Module):
         def maybe_dropout(): return torch.nn.Dropout(p=0.3) if dropout_flag else torch.nn.Identity()
 
         self.encoder = torch.nn.Sequential(
-            torch.nn.Conv2d(1, 32, 3, stride=2, padding=1),
+            torch.nn.Conv2d(no_ch, 32, 3, stride=2, padding=1),
             maybe_bn(32),
             torch.nn.LeakyReLU(0.01),
             torch.nn.Conv2d(32, 64, 3, stride=2, padding=1),
@@ -57,7 +57,7 @@ class AE(torch.nn.Module):
             torch.nn.ConvTranspose2d(64, 32, 3, stride=2, padding=1, output_padding=1),
             maybe_bn(32),
             torch.nn.LeakyReLU(0.01),
-            torch.nn.ConvTranspose2d(32, 1, 3, stride=2, padding=1, output_padding=1),
+            torch.nn.ConvTranspose2d(32, no_ch, 3, stride=2, padding=1, output_padding=1),
             torch.nn.Sigmoid()
         )
 
@@ -75,20 +75,20 @@ class AE(torch.nn.Module):
         z = self.encode(x)
         return self.decode(z), z
 
-    
 
 
 def plot_reconstruction_progress(model, dataloader, device, epoch):
     """Plot original vs reconstructed images during training"""
     model.eval()
     with torch.no_grad():
-        for x, _ in dataloader:
+        for x, _,_ in dataloader:
             x = x.to(device)
             recon, _ = model(x)
             break  # only one batch
 
     x = x.cpu()
     recon = recon.cpu()
+    print(x.shape)
 
     print(f"Input stats — min: {x.min().item():.4f}, max: {x.max().item():.4f}, mean: {x.mean().item():.4f}, std: {x.std().item():.4f}")
     print(f"Reconstruction stats — min: {recon.min().item():.4f}, max: {recon.max().item():.4f}, mean: {recon.mean().item():.4f}, std: {recon.std().item():.4f}")
@@ -131,7 +131,7 @@ def train_ae(model, train_loader, val_loader, device, epochs, lr, loss_norm_flag
     for epoch in range(epochs):
         model.train()
         train_loss = 0.0
-        for x, _ in train_loader:
+        for x, _, _ in train_loader:
             x = x.to(device)
             recon, _ = model(x)
             loss = loss_fn(recon, x)
@@ -145,7 +145,7 @@ def train_ae(model, train_loader, val_loader, device, epochs, lr, loss_norm_flag
         model.eval()
         val_loss = 0.0
         with torch.no_grad():
-            for x, _ in val_loader:
+            for x, _ , _ in val_loader:
                 x = x.to(device)
                 recon, _ = model(x)
                 loss = loss_fn(recon, x)
@@ -180,3 +180,103 @@ def train_ae(model, train_loader, val_loader, device, epochs, lr, loss_norm_flag
     fig.savefig(os.path.join(result_dir, 'train_val_losses.png'))
 
     return model, train_losses, val_losses
+
+
+
+
+
+##############################
+
+class BetaVAE32(nn.Module):
+    """
+    β-VAE for 32x32 patches.
+    Downsample: 32->16->8->4 (3 steps), then FC to latent.
+    Upsample mirrors back to 32.
+    """
+    def __init__(self, in_channels: int = 1, latent_dim: int = 12, out_activation: str = "sigmoid"):
+        super().__init__()
+        assert latent_dim > 0
+        assert out_activation in ("sigmoid", "identity")
+
+        self.in_channels = in_channels
+        self.latent_dim = latent_dim
+        self.out_activation = out_activation
+
+        # Encoder: 32 -> 16 -> 8 -> 4
+        self.enc = nn.Sequential(
+            nn.Conv2d(in_channels, 32, 4, stride=2, padding=1),  # 16x16
+            nn.BatchNorm2d(32),
+            nn.SiLU(),
+
+            nn.Conv2d(32, 64, 4, stride=2, padding=1),           # 8x8
+            nn.BatchNorm2d(64),
+            nn.SiLU(),
+
+            nn.Conv2d(64, 128, 4, stride=2, padding=1),          # 4x4
+            nn.BatchNorm2d(128),
+            nn.SiLU(),
+        )
+
+        self.enc_out_dim = 128 * 4 * 4
+        self.fc_mu = nn.Linear(self.enc_out_dim, latent_dim)
+        self.fc_logvar = nn.Linear(self.enc_out_dim, latent_dim)
+
+        # Decoder
+        self.fc_dec = nn.Linear(latent_dim, self.enc_out_dim)
+
+        self.dec_core = nn.Sequential(
+            nn.ConvTranspose2d(128, 64, 4, stride=2, padding=1),  # 8x8
+            nn.BatchNorm2d(64),
+            nn.SiLU(),
+
+            nn.ConvTranspose2d(64, 32, 4, stride=2, padding=1),   # 16x16
+            nn.BatchNorm2d(32),
+            nn.SiLU(),
+
+            nn.ConvTranspose2d(32, in_channels, 4, stride=2, padding=1),  # 32x32
+        )
+
+    def encode(self, x):
+        h = self.enc(x).view(x.size(0), -1)
+        mu = self.fc_mu(h)
+        logvar = self.fc_logvar(h)
+        return mu, logvar
+
+    @staticmethod
+    def reparameterize(mu, logvar):
+        std = torch.exp(0.5 * logvar)
+        eps = torch.randn_like(std)
+        return mu + std * eps
+
+    def decode(self, z):
+        h = self.fc_dec(z).view(z.size(0), 128, 4, 4)
+        xhat = self.dec_core(h)
+        if self.out_activation == "sigmoid":
+            xhat = torch.sigmoid(xhat)
+        return xhat
+
+    def forward(self, x):
+        mu, logvar = self.encode(x)
+        z = self.reparameterize(mu, logvar)
+        xhat = self.decode(z)
+        return xhat, mu, logvar, z
+
+
+def beta_vae_loss(x, xhat, mu, logvar, beta: float = 4.0, recon: str = "mse"):
+    """
+    recon:
+      - "mse": good default for microscopy/intensity
+      - "bce": only if x in [0,1] and you really want Bernoulli likelihood
+    """
+    if recon == "mse":
+        recon_loss = F.mse_loss(xhat, x, reduction="mean")
+    elif recon == "bce":
+        recon_loss = F.binary_cross_entropy(xhat, x, reduction="mean")
+    else:
+        raise ValueError("recon must be 'mse' or 'bce'")
+
+    kl_per_sample = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=1)
+    kl_loss = kl_per_sample.mean()
+
+    total = recon_loss + beta * kl_loss
+    return total, recon_loss, kl_loss
