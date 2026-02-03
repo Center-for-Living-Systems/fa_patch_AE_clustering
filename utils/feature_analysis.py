@@ -104,7 +104,7 @@ def data_to_latents(model, dataloader, device):
 
 
 def patch_csv_to_AE_latent(ctrl_y_str, csv_folder, csv_filename,
-                           group_labels, ae, device):
+                           group_labels, model_min, model_max,newdata_min, newdata_max,ae, device):
 
     all_image_csv = pd.read_csv(os.path.join(csv_folder, csv_filename))
 
@@ -127,7 +127,11 @@ def patch_csv_to_AE_latent(ctrl_y_str, csv_folder, csv_filename,
                              row["crop_img_filename"])
             )
 
-            tensor_patch = patch_2_normed_tensor(raw_patch, device)
+            if(model_max == newdata_max and model_min == newdata_min):
+                tensor_patch = patch_2_normed_tensor(raw_patch, device)
+            else:
+                tensor_patch = histmatch_patch_2_normed_tensor(raw_patch, model_min, model_max, newdata_min, newdata_max, device)
+                
 
             # ---- run AE ----
             with torch.no_grad():
@@ -162,6 +166,17 @@ def patch_csv_to_AE_latent(ctrl_y_str, csv_folder, csv_filename,
 
 def patch_2_normed_tensor(raw_patch,device):
     normed_raw_patch = raw_patch.copy() * 240 
+    normed_raw_patch[normed_raw_patch > 254] = 254
+    normed_raw_patch = normed_raw_patch/255
+    tensor_patch = torch.from_numpy(normed_raw_patch)
+    tensor_patch = tensor_patch.unsqueeze(0).unsqueeze(0)
+    tensor_patch = tensor_patch.to(device)
+    return tensor_patch
+    
+def histmatch_patch_2_normed_tensor(raw_patch,model_min, model_max,newdata_min, newdata_max,device):
+    normed_01_raw_patch = (raw_patch.copy()*65535 - newdata_min)/(newdata_max-newdata_min)
+    matched_raw_patch = (normed_01_raw_patch.copy()*(model_max-model_min) + model_min)/65535
+    normed_raw_patch = matched_raw_patch.copy() * 240 
     normed_raw_patch[normed_raw_patch > 254] = 254
     normed_raw_patch = normed_raw_patch/255
     tensor_patch = torch.from_numpy(normed_raw_patch)
