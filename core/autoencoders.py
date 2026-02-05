@@ -12,6 +12,8 @@ from sklearn.cluster import KMeans
 from sklearn.manifold import TSNE
 import os
 import joblib
+import torch.nn.functional as F
+
 
 class AE(torch.nn.Module):
     def __init__(self, latent_dim=8, input_ps=32, no_ch = 1,BN_flag=False, dropout_flag=False):
@@ -187,11 +189,13 @@ def train_ae(model, train_loader, val_loader, device, epochs, lr, loss_norm_flag
 
 ##############################
 
-class BetaVAE32(nn.Module):
+# -------------------------
+# VAE (standard) for 32x32
+# -------------------------
+class VAE32(nn.Module):
     """
-    β-VAE for 32x32 patches.
-    Downsample: 32->16->8->4 (3 steps), then FC to latent.
-    Upsample mirrors back to 32.
+    Standard VAE for 32x32 patches (beta=1 by default in loss).
+    Same architecture as your BetaVAE32.
     """
     def __init__(self, in_channels: int = 1, latent_dim: int = 12, out_activation: str = "sigmoid"):
         super().__init__()
@@ -223,7 +227,6 @@ class BetaVAE32(nn.Module):
 
         # Decoder
         self.fc_dec = nn.Linear(latent_dim, self.enc_out_dim)
-
         self.dec_core = nn.Sequential(
             nn.ConvTranspose2d(128, 64, 4, stride=2, padding=1),  # 8x8
             nn.BatchNorm2d(64),
@@ -262,11 +265,13 @@ class BetaVAE32(nn.Module):
         return xhat, mu, logvar, z
 
 
-def beta_vae_loss(x, xhat, mu, logvar, beta: float = 4.0, recon: str = "mse"):
+# -------------------------
+# Loss for VAE / Beta-VAE
+# -------------------------
+def vae_loss(x, xhat, mu, logvar, beta: float = 1.0, recon: str = "mse"):
     """
-    recon:
-      - "mse": good default for microscopy/intensity
-      - "bce": only if x in [0,1] and you really want Bernoulli likelihood
+    beta=1.0 -> standard VAE
+    beta>1.0 -> beta-VAE
     """
     if recon == "mse":
         recon_loss = F.mse_loss(xhat, x, reduction="mean")
@@ -280,3 +285,137 @@ def beta_vae_loss(x, xhat, mu, logvar, beta: float = 4.0, recon: str = "mse"):
 
     total = recon_loss + beta * kl_loss
     return total, recon_loss, kl_loss
+
+
+# -------------------------
+# Training loop (VAE/BetaVAE)
+# -------------------------
+def train_vae(
+    model,
+    train_loader,
+    val_loader,
+    device,
+    epochs,
+    lr,
+    beta,
+    recon_type,
+    result_dir,
+    loss_norm_flag=False,  # optional; usually False for VAE
+):
+    optimizer = optim.Adam(model.parameters(), lr=lr)
+
+    train_losses, val_losses = [], []
+    train_recon_losses, train_kl_losses = [], []
+    val_recon_losses, val_kl_losses = [], []
+
+    error_print_period = max(1, int(epochs / 50))
+    recon_view_period = max(1, int(epochs / 10))
+
+    for epoch in range(epochs):
+        # ---- train ----
+        model.train()
+        total_loss = 0.0
+        total_recon = 0.0
+        total_kl = 0.0
+
+        for x, _, _ in train_loader:
+            x = x.to(device)
+            xhat, mu, logvar, z = model(x)
+
+            loss, recon_l, kl_l = vae_loss(x, xhat, mu, logvar, beta=beta, recon=recon_type)
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            total_loss += loss.item()
+            total_recon += recon_l.item()
+            total_kl += kl_l.item()
+
+        total_loss /= len(train_loader)
+        total_recon /= len(train_loader)
+        total_kl /= len(train_loader)
+
+        train_losses.append(total_loss)
+        train_recon_losses.append(total_recon)
+        train_kl_losses.append(total_kl)
+
+        # ---- val ----
+        model.eval()
+        v_loss = 0.0
+        v_recon = 0.0
+        v_kl = 0.0
+
+        with torch.no_grad():
+            for x, _, _ in val_loader:
+                x = x.to(device)
+                xhat, mu, logvar, z = model(x)
+                loss, recon_l, kl_l = vae_loss(x, xhat, mu, logvar, beta=beta, recon=recon_type)
+
+                v_loss += loss.item()
+                v_recon += recon_l.item()
+                v_kl += kl_l.item()
+
+        v_loss /= len(val_loader)
+        v_recon /= len(val_loader)
+        v_kl /= len(val_loader)
+
+        val_losses.append(v_loss)
+        val_recon_losses.append(v_recon)
+        val_kl_losses.append(v_kl)
+
+        if (epoch + 1) % error_print_period == 0:
+            print(
+                f"Epoch {epoch+1}/{epochs} | "
+                f"Train: total={total_loss:.4f} recon={total_recon:.4f} kl={total_kl:.4f} | "
+                f"Val: total={v_loss:.4f} recon={v_recon:.4f} kl={v_kl:.4f}"
+            )
+
+        if (epoch + 1) % recon_view_period == 0:
+            # save recon preview
+            fig = plt.figure(figsize=(8, 3))
+            model.eval()
+            with torch.no_grad():
+                for x, _, _ in val_loader:
+                    x = x.to(device)
+                    xhat, *_ = model(x)
+                    x = x.cpu()
+                    xhat = xhat.cpu()
+                    break
+
+            n = min(8, x.size(0))
+            for i in range(n):
+                plt.subplot(2, n, i + 1)
+                plt.imshow(x[i].squeeze(), cmap="gray", vmin=0, vmax=1)
+                plt.axis("off")
+                plt.subplot(2, n, n + i + 1)
+                plt.imshow(xhat[i].squeeze(), cmap="gray", vmin=0, vmax=1)
+                plt.axis("off")
+            plt.suptitle(f"Recon @ epoch {epoch+1}")
+            plt.tight_layout()
+            fig.savefig(os.path.join(result_dir, f"vae_recon_epoch{epoch+1}.png"))
+            plt.close(fig)
+
+            # save model checkpoint
+            torch.save(model, os.path.join(result_dir, f"vae_model_ep{epoch+1}.pt"))
+
+    # save curves
+    joblib.dump(train_losses, os.path.join(result_dir, "vae_train_total.pkl"))
+    joblib.dump(val_losses, os.path.join(result_dir, "vae_val_total.pkl"))
+    joblib.dump(train_recon_losses, os.path.join(result_dir, "vae_train_recon.pkl"))
+    joblib.dump(val_recon_losses, os.path.join(result_dir, "vae_val_recon.pkl"))
+    joblib.dump(train_kl_losses, os.path.join(result_dir, "vae_train_kl.pkl"))
+    joblib.dump(val_kl_losses, os.path.join(result_dir, "vae_val_kl.pkl"))
+
+    # plot total loss
+    fig = plt.figure(figsize=(8, 6))
+    plt.plot(range(epochs), train_losses, label="Train Total")
+    plt.plot(range(epochs), val_losses, label="Val Total")
+    plt.xlabel("Epochs")
+    plt.ylabel("Loss")
+    plt.legend()
+    plt.title("VAE Total Loss")
+    fig.savefig(os.path.join(result_dir, "vae_train_val_total.png"))
+    plt.close(fig)
+
+    return model, train_losses, val_losses
