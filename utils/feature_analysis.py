@@ -19,7 +19,7 @@ import tifffile
 from scipy.ndimage import distance_transform_cdt
 
 
-def dataloader_model_latents(model, dataloader, device):
+def dataloader_AE_VAE_latents(model, dataloader, device, latent_source="mu"):
     model.eval()
     latents = []
     images = []
@@ -27,8 +27,49 @@ def dataloader_model_latents(model, dataloader, device):
     with torch.no_grad():
         for x, group_id,_ in dataloader:
             x = x.to(device)
-            _, z = model(x)
-            latents.append(z.cpu().numpy())
+            
+            out = model(x)
+
+            # AE: (recon, z)
+            if isinstance(out, (tuple, list)) and len(out) == 2:
+                recon, z = out
+                latent = z
+
+            # VAE/BetaVAE: (xhat, mu, logvar, z)
+            elif isinstance(out, (tuple, list)) and len(out) == 4:
+                xhat, mu, logvar, z = out
+                latent = mu if latent_source == "mu" else z
+
+            latents.append(latent.detach().cpu().numpy())
+            images.append(x.cpu())
+            group_ids.append(group_id)
+    latents = np.concatenate(latents, axis=0)
+    images = torch.cat(images, dim=0)
+    return latents, images, group_ids
+
+
+def dataloader_model_latents(model, dataloader, device, latent_source="mu"):
+    model.eval()
+    latents = []
+    images = []
+    group_ids = []
+    with torch.no_grad():
+        for x, group_id,_ in dataloader:
+            x = x.to(device)
+            
+            out = model(x)
+
+            # AE: (recon, z)
+            if isinstance(out, (tuple, list)) and len(out) == 2:
+                recon, z = out
+                latent = z
+
+            # VAE/BetaVAE: (xhat, mu, logvar, z)
+            elif isinstance(out, (tuple, list)) and len(out) == 4:
+                xhat, mu, logvar, z = out
+                latent = mu if latent_source == "mu" else z
+
+            latents.append(latent.detach().cpu().numpy())
             images.append(x.cpu())
             group_ids.append(group_id)
     latents = np.concatenate(latents, axis=0)
